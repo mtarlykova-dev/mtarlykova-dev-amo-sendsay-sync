@@ -2,7 +2,8 @@
 """
 amoCRM (Inbound, «Причина отказа.» = «Не удалось связаться») → Sendsay (список pl42130)
 
-Передаёт: имя, фамилию, компанию, телефон, email, должность, сферу компании.
+Передаёт: имя, фамилию, компанию, телефон, email — только контакты с включённым
+«Согласием на рекламные рассылки».
 
 Режимы:
   python sync_noreach.py                 # инкремент: сделки, изменённые за LOOKBACK_HOURS
@@ -31,8 +32,7 @@ REASON_VALUE = os.getenv("AMO_REASON_VALUE", "Не удалось связать
 ONLY_LOST = os.getenv("ONLY_LOST", "1") == "1"                      # только этап «Закрыто и не реализовано» (143)
 MAIN_CONTACT_ONLY = os.getenv("MAIN_CONTACT_ONLY", "1") == "1"
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "3"))
-POSITION_FIELD_ID = os.getenv("AMO_POSITION_FIELD_ID")              # если не задано — ищем по названию «Должность»
-INDUSTRY_FIELD_ID = os.getenv("AMO_INDUSTRY_FIELD_ID")              # если не задано — ищем по названию «Сфера»
+CONSENT_FIELD_ID = int(os.getenv("AMO_CONSENT_FIELD_ID", "704923"))  # контакт: «Согласие на рекламные рассылки» (чекбокс)
 
 SENDSAY_LOGIN = os.getenv("SENDSAY_LOGIN", "")                      # общий логин аккаунта Sendsay
 SENDSAY_APIKEY = os.getenv("SENDSAY_APIKEY", "")
@@ -43,8 +43,6 @@ SENDSAY_FIELDS = json.loads(os.getenv("SENDSAY_FIELDS", json.dumps({
     "last_name": "amo.last_name",
     "company": "amo.company",
     "phone": "amo.phone",
-    "position": "amo.position",
-    "industry": "amo.industry",
     "lead_id": "amo.lead_id",
 })))
 LOST_STATUS_ID = 143
@@ -97,24 +95,19 @@ def amo_by_ids(path, key, ids, extra=None):
     return out
 
 
-def find_field(entity, explicit_id, name_part, exclude=()):
-    if explicit_id:
-        return int(explicit_id)
-    fields = list(amo_paginate(f"/api/v4/{entity}/custom_fields", "custom_fields"))
-    exact = [f for f in fields if f["name"].strip(" •").lower() == name_part.lower()]
-    if exact:
-        return exact[0]["id"]
-    loose = [f for f in fields if name_part.lower() in f["name"].lower()
-             and not any(x.lower() in f["name"].lower() for x in exclude)]
-    return loose[0]["id"] if loose else None
-
-
 def cf_value(entity, field_id=None, code=None):
     for f in entity.get("custom_fields_values") or []:
         if (field_id and f.get("field_id") == field_id) or (code and f.get("field_code") == code):
             vals = [str(v.get("value", "")).strip() for v in f.get("values") or [] if v.get("value")]
             return vals
     return []
+
+
+def has_consent(contact):
+    for f in contact.get("custom_fields_values") or []:
+        if f.get("field_id") == CONSENT_FIELD_ID:
+            return any(v.get("value") in (True, 1, "1", "true", "True") for v in f.get("values") or [])
+    return False
 
 
 def has_reason(lead):
@@ -134,7 +127,7 @@ def fetch_leads(updated_from=None):
             yield lead
 
 
-def build_rows(leads, position_fid, industry_fid):
+def build_rows(leads):
     contact_ids, company_ids = set(), set()
     for lead in leads:
         emb = lead.get("_embedded") or {}
@@ -150,7 +143,7 @@ def build_rows(leads, position_fid, industry_fid):
             company_ids.add(co["id"])
     companies = amo_by_ids("/api/v4/companies", "companies", company_ids)
 
-    rows, skipped_no_email = {}, 0
+    rows, skipped = {}, {"no_email": 0, "no_consent": 0}
     for lead in leads:
         emb = lead.get("_embedded") or {}
         lead_company = next(iter(emb.get("companies") or []), None)
@@ -160,9 +153,12 @@ def build_rows(leads, position_fid, industry_fid):
             c = contacts.get(link["id"])
             if not c:
                 continue
+            if not has_consent(c):
+                skipped["no_consent"] += 1
+                continue
             emails = cf_value(c, code="EMAIL")
             if not emails:
-                skipped_no_email += 1
+                skipped["no_email"] += 1
                 continue
             co_ref = lead_company or next(iter((c.get("_embedded") or {}).get("companies") or []), None)
             co = companies.get(co_ref["id"]) if co_ref else None
@@ -179,11 +175,9 @@ def build_rows(leads, position_fid, industry_fid):
                 "last_name": last,
                 "company": (co or {}).get("name", "") or "",
                 "phone": ", ".join(cf_value(c, code="PHONE")),
-                "position": ", ".join(cf_value(c, field_id=position_fid)) if position_fid else "",
-                "industry": ", ".join(cf_value(co, field_id=industry_fid)) if (co and industry_fid) else "",
                 "lead_id": str(lead["id"]),
             }
-    return list(rows.values()), skipped_no_email
+    return list(rows.values()), skipped
 
 
 # ---------- Sendsay ----------
@@ -208,7 +202,7 @@ def sendsay(action, payload):
 
 
 def push_to_sendsay(rows):
-    keys = ["first_name", "last_name", "company", "phone", "position", "industry", "lead_id"]
+    keys = ["first_name", "last_name", "company", "phone", "lead_id"]
     caption = [{"anketa": "member", "quest": "email"}]
     for k in keys:
         anketa, quest = SENDSAY_FIELDS[k].split(".", 1)
@@ -247,20 +241,20 @@ def main():
 
     if args.test_email:
         push_to_sendsay([{"email": args.test_email.lower(), "first_name": "Тест", "last_name": "Интеграции",
-                          "company": "Solar Staff", "phone": "+70000000000", "position": "Тест",
-                          "industry": "Тест", "lead_id": "0"}])
+                          "company": "Solar Staff", "phone": "+70000000000", "lead_id": "0"}])
         print(f"Готово. Проверь в Sendsay, что в списке {SENDSAY_LIST_ID} появился {args.test_email} с полями.")
         return
 
-    position_fid = find_field("contacts", POSITION_FIELD_ID, "Должность", exclude=("Полное",))
-    industry_fid = find_field("companies", INDUSTRY_FIELD_ID, "Сфера")
-
     if args.describe:
         print(f"Воронка: {PIPELINE_ID}, поле причины: {REASON_FIELD_ID} = «{REASON_VALUE}», только этап 143: {ONLY_LOST}")
-        print(f"Контакт «Должность»: field_id={position_fid}")
-        print(f"Компания «Сфера»:    field_id={industry_fid}")
+        consent = amo_get(f"/api/v4/contacts/custom_fields/{CONSENT_FIELD_ID}")
+        print(f"Поле согласия у контакта: {CONSENT_FIELD_ID} — «{consent.get('name')}» (тип {consent.get('type')})")
         if SENDSAY_LOGIN and SENDSAY_APIKEY:
-            print("Анкеты Sendsay:", json.dumps(sendsay("anketa.list", {}).get("list"), ensure_ascii=False, indent=1))
+            for a in sendsay("anketa.list", {}).get("list") or []:
+                print(f"\nАнкета Sendsay «{a.get('name')}» — id: {a.get('id')}")
+                obj = sendsay("anketa.get", {"id": a["id"]}).get("obj") or {}
+                for qid, q in (obj.get("quests") or {}).items():
+                    print(f"   {a['id']}.{qid}  —  {q.get('name')}")
         return
 
     updated_from = None
@@ -272,8 +266,9 @@ def main():
     print(f"amoCRM: ищу сделки Inbound с причиной «{REASON_VALUE}»"
           + (f", изменённые с {updated_from:%Y-%m-%d %H:%M} UTC" if updated_from else " (вся история)"))
     leads = list(fetch_leads(updated_from))
-    rows, no_email = build_rows(leads, position_fid, industry_fid)
-    print(f"  сделок: {len(leads)}, контактов с email: {len(rows)}, без email (пропущены): {no_email}")
+    rows, skipped = build_rows(leads)
+    print(f"  сделок: {len(leads)}, к отправке: {len(rows)}; пропущено — без согласия: {skipped['no_consent']}, "
+          f"без email: {skipped['no_email']}")
 
     if args.dry_run:
         for r in rows[:50]:
