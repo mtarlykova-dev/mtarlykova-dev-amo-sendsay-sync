@@ -2,7 +2,7 @@
 """
 amoCRM (Inbound, «Причина отказа.» = «Не удалось связаться») → Sendsay (список pl42130)
 
-Передаёт: имя, фамилию, компанию, телефон, email — только контакты с включённым
+Передаёт: имя, фамилию, компанию, email, id сделки — только контакты с включённым
 «Согласием на рекламные рассылки».
 
 Режимы:
@@ -37,13 +37,12 @@ CONSENT_FIELD_ID = int(os.getenv("AMO_CONSENT_FIELD_ID", "704923"))  # конт�
 SENDSAY_LOGIN = os.getenv("SENDSAY_LOGIN", "")                      # общий логин аккаунта Sendsay
 SENDSAY_APIKEY = os.getenv("SENDSAY_APIKEY", "")
 SENDSAY_LIST_ID = os.getenv("SENDSAY_LIST_ID", "pl42130")
-# Куда класть данные в Sendsay: «анкета.поле». Анкету нужно создать заранее (README, шаг 2).
+# Куда класть данные в Sendsay: «анкета.поле» (существующие поля аккаунта). Email — в member.email.
 SENDSAY_FIELDS = json.loads(os.getenv("SENDSAY_FIELDS", json.dumps({
-    "first_name": "amo.first_name",
-    "last_name": "amo.last_name",
-    "company": "amo.company",
-    "phone": "amo.phone",
-    "lead_id": "amo.lead_id",
+    "first_name": "base.firstName",
+    "last_name": "base.lastName",
+    "company": "custom.kompaniya",
+    "lead_id": "custom.id_sdelki",
 })))
 LOST_STATUS_ID = 143
 BATCH = 500
@@ -174,7 +173,6 @@ def build_rows(leads):
                 "first_name": first,
                 "last_name": last,
                 "company": (co or {}).get("name", "") or "",
-                "phone": ", ".join(cf_value(c, code="PHONE")),
                 "lead_id": str(lead["id"]),
             }
     return list(rows.values()), skipped
@@ -202,7 +200,7 @@ def sendsay(action, payload):
 
 
 def push_to_sendsay(rows):
-    keys = ["first_name", "last_name", "company", "phone", "lead_id"]
+    keys = ["first_name", "last_name", "company", "lead_id"]
     caption = [{"anketa": "member", "quest": "email"}]
     for k in keys:
         anketa, quest = SENDSAY_FIELDS[k].split(".", 1)
@@ -241,7 +239,7 @@ def main():
 
     if args.test_email:
         push_to_sendsay([{"email": args.test_email.lower(), "first_name": "Тест", "last_name": "Интеграции",
-                          "company": "Solar Staff", "phone": "+70000000000", "lead_id": "0"}])
+                          "company": "Solar Staff", "lead_id": "0"}])
         print(f"Готово. Проверь в Sendsay, что в списке {SENDSAY_LIST_ID} появился {args.test_email} с полями.")
         return
 
