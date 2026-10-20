@@ -1,0 +1,51 @@
+name: amoCRM → Sendsay (Inbound, не удалось связаться)
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # каждый час в :17 (UTC); окно поиска 3 ч, повторы безопасны
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Режим"
+        type: choice
+        options: [incremental, full, dry-run, describe, test-email]
+        default: incremental
+      since_days:
+        description: "Для full: только сделки, изменённые за N дней (пусто — вся история)"
+        required: false
+      test_email:
+        description: "Для test-email: адрес для проверки"
+        required: false
+
+concurrency:
+  group: sync-noreach
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - name: Run
+        env:
+          AMO_DOMAIN: solarstaff.amocrm.ru
+          AMO_TOKEN: ${{ secrets.AMO_TOKEN }}
+          SENDSAY_LOGIN: ${{ secrets.SENDSAY_LOGIN }}
+          SENDSAY_APIKEY: ${{ secrets.SENDSAY_APIKEY }}
+          SENDSAY_LIST_ID: pl42130
+          MODE: ${{ inputs.mode || 'incremental' }}
+          SINCE_DAYS: ${{ inputs.since_days }}
+          TEST_EMAIL: ${{ inputs.test_email }}
+        run: |
+          case "$MODE" in
+            full)       python sync_noreach.py --full ${SINCE_DAYS:+--since-days $SINCE_DAYS} ;;
+            dry-run)    python sync_noreach.py --full ${SINCE_DAYS:+--since-days $SINCE_DAYS} --dry-run ;;
+            describe)   python sync_noreach.py --describe ;;
+            test-email) python sync_noreach.py --test-email "$TEST_EMAIL" ;;
+            *)          python sync_noreach.py ;;
+          esac
