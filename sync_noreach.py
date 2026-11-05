@@ -2,6 +2,7 @@
 """
 amoCRM (Inbound, «Причина отказа.» = «Не удалось связаться») → Sendsay (список pl42130)
 
+Добавляет контакт в список и запускает его в сценарий Sendsay (по умолчанию ID 7).
 Передаёт: имя, фамилию, компанию, email, id сделки — только контакты с включённым
 «Согласием на рекламные рассылки».
 
@@ -37,6 +38,8 @@ CONSENT_FIELD_ID = int(os.getenv("AMO_CONSENT_FIELD_ID", "704923"))  # конт�
 SENDSAY_LOGIN = os.getenv("SENDSAY_LOGIN", "")                      # общий логин аккаунта Sendsay
 SENDSAY_APIKEY = os.getenv("SENDSAY_APIKEY", "")
 SENDSAY_LIST_ID = os.getenv("SENDSAY_LIST_ID", "pl42130")
+SENDSAY_WORKFLOW_ID = os.getenv("SENDSAY_WORKFLOW_ID", "7")            # сценарий «Inbound (не удалось связаться)»; пусто — не запускать
+SENDSAY_START_ACTION = os.getenv("SENDSAY_START_ACTION", "sequence.member.start")
 # Куда класть данные в Sendsay: «анкета.поле» (существующие поля аккаунта). Email — в member.email.
 SENDSAY_FIELDS = json.loads(os.getenv("SENDSAY_FIELDS", json.dumps({
     "first_name": "base.firstName",
@@ -45,7 +48,6 @@ SENDSAY_FIELDS = json.loads(os.getenv("SENDSAY_FIELDS", json.dumps({
     "lead_id": "custom.id_sdelki",
 })))
 LOST_STATUS_ID = 143
-BATCH = 500
 
 
 # ---------- amoCRM ----------
@@ -182,7 +184,7 @@ def build_rows(leads):
 SENDSAY_URL = f"https://api.sendsay.ru/general/api/v100/json/{SENDSAY_LOGIN}"
 
 
-def sendsay(action, payload):
+def sendsay(action, payload, raise_errors=True):
     global SENDSAY_URL
     body = {"action": action, **payload}
     for _ in range(3):
@@ -193,33 +195,64 @@ def sendsay(action, payload):
         if "REDIRECT" in data:  # Sendsay может перенаправить на другой сервер аккаунта
             SENDSAY_URL = "https://api.sendsay.ru/general/api/v100/json" + data["REDIRECT"]
             continue
-        if data.get("errors"):
+        if data.get("errors") and raise_errors:
             raise RuntimeError(f"Sendsay {action}: {json.dumps(data['errors'], ensure_ascii=False)}")
         return data
     raise RuntimeError("Sendsay: слишком много редиректов")
 
 
-def push_to_sendsay(rows):
-    keys = ["first_name", "last_name", "company", "lead_id"]
-    caption = [{"anketa": "member", "quest": "email"}]
-    for k in keys:
-        anketa, quest = SENDSAY_FIELDS[k].split(".", 1)
-        caption.append({"anketa": anketa, "quest": quest})
+def upsert_member(row):
+    """Создать/обновить контакт, записать поля и добавить в список — синхронно."""
+    datakey = []
+    for k in ("first_name", "last_name", "company", "lead_id"):
+        if row.get(k):  # пустым не затираем то, что уже есть в Sendsay
+            datakey.append([SENDSAY_FIELDS[k], "set", row[k]])
+    datakey.append([f"-group.{SENDSAY_LIST_ID}", "set", "1"])
+    sendsay("member.set", {
+        "email": row["email"],
+        "addr_type": "email",
+        "if_exists": "must_merge",
+        "newbie.confirm": 0,
+        "datakey": datakey,
+    })
 
-    for i in range(0, len(rows), BATCH):
-        chunk = rows[i:i + BATCH]
-        payload = {
-            "addr_type": "email",
-            "newbie.confirm": 0,
-            "if_exists": "must_merge",
-            "users.list": {"caption": caption, "rows": [[r["email"]] + [r[k] for k in keys] for r in chunk]},
-            "auto_group": {"id": SENDSAY_LIST_ID, "clean": 0},  # добавить в список, не очищая его
-        }
-        res = sendsay("member.import", payload)
-        print(f"  → Sendsay: отправлено {len(chunk)} (пачка {i // BATCH + 1})")
-        track_id = res.get("track.id") or (res.get("track") or {}).get("id")
-        if track_id:  # импорт в Sendsay асинхронный — результат виден в «Журнале заданий»
-            print(f"    задание Sendsay: {track_id}")
+
+def start_workflow(email):
+    """Запустить контакт в сценарий. Повторные прохождения в сценарии выключены —
+    Sendsay сам не пустит контакт второй раз, такие ответы считаем «уже был»."""
+    res = sendsay(SENDSAY_START_ACTION, {"id": int(SENDSAY_WORKFLOW_ID), "email": email, "addr_type": "email"},
+                  raise_errors=False)
+    errors = res.get("errors") or []
+    if not errors:
+        return "started", res
+    text = json.dumps(errors, ensure_ascii=False)
+    if any(w in text.lower() for w in ("already", "exists", "уже", "repeat", "повтор")):
+        return "already", text
+    return "error", text
+
+
+def push_to_sendsay(rows, start=True, verbose=False):
+    stats = {"saved": 0, "started": 0, "already": 0, "errors": 0}
+    do_start = start and bool(SENDSAY_WORKFLOW_ID)
+    for r in rows:
+        try:
+            upsert_member(r)
+            stats["saved"] += 1
+        except Exception as e:
+            stats["errors"] += 1
+            print(f"  ! {r['email']}: не удалось записать в Sendsay — {e}")
+            continue
+        if do_start:
+            status, info = start_workflow(r["email"])
+            stats[status if status != "error" else "errors"] += 1
+            if status == "error" or verbose:
+                print(f"  {'!' if status == 'error' else '·'} {r['email']}: сценарий {SENDSAY_WORKFLOW_ID} — {status}: {info}")
+        time.sleep(0.1)
+    print(f"  → Sendsay: в списке {SENDSAY_LIST_ID}: {stats['saved']}"
+          + (f"; сценарий {SENDSAY_WORKFLOW_ID}: запущено {stats['started']}, уже проходили {stats['already']}"
+             if do_start else "; сценарий не запускался")
+          + f"; ошибок: {stats['errors']}")
+    return stats
 
 
 # ---------- main ----------
@@ -230,6 +263,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--describe", action="store_true")
     ap.add_argument("--test-email")
+    ap.add_argument("--no-start", action="store_true", help="только список, без запуска сценария")
     args = ap.parse_args()
 
     missing = [n for n, v in [("AMO_TOKEN", AMO_TOKEN), ("SENDSAY_LOGIN", SENDSAY_LOGIN),
@@ -239,8 +273,8 @@ def main():
 
     if args.test_email:
         push_to_sendsay([{"email": args.test_email.lower(), "first_name": "Тест", "last_name": "Интеграции",
-                          "company": "Solar Staff", "lead_id": "0"}])
-        print(f"Готово. Проверь в Sendsay, что в списке {SENDSAY_LIST_ID} появился {args.test_email} с полями.")
+                          "company": "Solar Staff", "lead_id": "0"}], start=not args.no_start, verbose=True)
+        print(f"Проверь в Sendsay: {args.test_email} в списке {SENDSAY_LIST_ID} и среди участников сценария {SENDSAY_WORKFLOW_ID}.")
         return
 
     if args.describe:
@@ -248,6 +282,9 @@ def main():
         consent = amo_get(f"/api/v4/contacts/custom_fields/{CONSENT_FIELD_ID}")
         print(f"Поле согласия у контакта: {CONSENT_FIELD_ID} — «{consent.get('name')}» (тип {consent.get('type')})")
         if SENDSAY_LOGIN and SENDSAY_APIKEY:
+            res = sendsay("sequence.list", {}, raise_errors=False)
+            print("\nСценарии Sendsay (sequence.list):", json.dumps(res.get("list") or res.get("errors") or res,
+                                                               ensure_ascii=False)[:3000])
             for a in sendsay("anketa.list", {}).get("list") or []:
                 print(f"\nАнкета Sendsay «{a.get('name')}» — id: {a.get('id')}")
                 obj = sendsay("anketa.get", {"id": a["id"]}).get("obj") or {}
@@ -275,7 +312,7 @@ def main():
             print(f"   … и ещё {len(rows) - 50}")
         return
     if rows:
-        push_to_sendsay(rows)
+        push_to_sendsay(rows, start=not args.no_start)
     print("Готово.")
 
 
