@@ -211,7 +211,7 @@ def upsert_member(row):
     sendsay("member.set", {
         "email": row["email"],
         "addr_type": "email",
-        "if_exists": "must_merge",
+        "if_exists": "overwrite",  # с datakey меняются только перечисленные поля
         "newbie.confirm": 0,
         "datakey": datakey,
     })
